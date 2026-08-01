@@ -44,3 +44,16 @@ Liquid `diffusion_generate` (HF) harness, on the ROCm `vllm/vllm-openai-rocm`
 TPOT=0 / TTFT==E2EL is expected (the whole canvas commits at once — no token
 streaming). Median 56 ms at conc=1 (eager) is near the <50 ms target a
 cudagraph/compiled forward would clear.
+
+## Compiled + PIECEWISE cudagraph (`bench_serve_cg.sbatch`, same ckpt/queries)
+| conc | median E2EL (eager → compiled) | notes |
+|-----:|-------------------------------:|-------|
+| 1    | 55.9 → **41.3 ms** (<50 ms target) | steady-state; mean/P99 inflated by torch.compile warmup (first requests recompile) |
+| 8    | 71.4 → 71.3 ms                 | piecewise + eager conv; throughput lower under compile warmup |
+
+vLLM auto-selects FULL cudagraph, which the mamba backend rejects for diffusion:
+`mamba_attn.py:183` asserts `max_query_len == 1 + num_spec_tokens` (AR spec-decode
+= 129), but the diffusion canvas is exactly `num_spec_tokens` = 128 (no +1 bonus
+token, since `num_new_sampled_tokens_per_step = 0`). PIECEWISE sidesteps it
+(compile attention/MLP, conv eager). FULL cudagraph — capturing the whole hot
+canvas forward — needs a diffusion-aware relaxation of that assertion.
