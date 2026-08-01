@@ -38,10 +38,12 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.model_executor.models.lfm2 import Lfm2ForCausalLM
-from vllm.v1.outputs import LogprobsTensors  # noqa: F401  (future logprobs)
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor, async_copy_to_gpu
-from vllm.v1.worker.gpu.model_states.interface import ModelState
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+    MambaHybridAttnMetadata,
+    MambaHybridModelState,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 logger = init_logger(__name__)
@@ -275,7 +277,7 @@ def _compiled_sample_step(
 # ---------------------------------------------------------------------------
 
 
-class Lfm2DiffusionModelState(ModelState):
+class Lfm2DiffusionModelState(MambaHybridModelState):
     """ModelState for the LFM2 diffusion decoder.
 
     encoder mode (num_draft_tokens == 0): causal attention, writes KV/conv state.
@@ -317,20 +319,9 @@ class Lfm2DiffusionModelState(ModelState):
         self._causal_buf = torch.zeros(
             self.max_num_reqs, dtype=torch.bool, device=device
         )
-        # Persistent inputs_embeds buffer so CUDA graph capture and runtime
-        # point at the same address.
-        self._inputs_embeds_buf = torch.zeros(
-            self.max_num_tokens,
-            text_config.hidden_size,
-            dtype=self.model_config.dtype,
-            device=device,
-        )
 
     def get_supported_generation_tasks(self):
         return ("generate",)
-
-    def get_mm_embeddings(self, scheduled_encoder_inputs, input_batch, req_states):
-        return None
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         gen = self.gen_config or {}
@@ -361,6 +352,8 @@ class Lfm2DiffusionModelState(ModelState):
         ), None
 
     def add_request(self, req_index: int, new_req_data: Any) -> None:
+        # Mamba/ShortConv state bookkeeping (num_accepted, align seed).
+        super().add_request(req_index, new_req_data)
         self._req_id_to_index[new_req_data.req_id] = req_index
         self.diffusion_states.add_request(req_index)
         if not new_req_data.req_id.startswith("_warmup_"):
@@ -373,20 +366,6 @@ class Lfm2DiffusionModelState(ModelState):
         if idx is not None:
             self.diffusion_states.remove_request(idx)
 
-    def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
-        num_tokens = input_batch.num_tokens
-        num_tokens_padded = input_batch.num_tokens_after_padding
-        inputs_embeds = self._inputs_embeds_buf[:num_tokens_padded]
-        input_ids = input_batch.input_ids[:num_tokens]
-        inputs_embeds[:num_tokens].copy_(self.model.embed_input_ids(input_ids))
-        return {"inputs_embeds": inputs_embeds}
-
-    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
-        return {"inputs_embeds": self._inputs_embeds_buf[:num_tokens]}
-
-    def postprocess_state(self, idx_mapping, num_sampled, num_computed_tokens=None):
-        return None
-
     def prepare_attn(
         self,
         input_batch,
@@ -397,6 +376,10 @@ class Lfm2DiffusionModelState(ModelState):
         kv_cache_config,
         for_capture=False,
     ) -> dict[str, Any]:
+        # Mirror MambaHybridModelState.prepare_attn (which supplies is_prefilling,
+        # seq_lens_cpu_upper_bound, and the mamba/ShortConv spec metadata the conv
+        # metadata builder requires) and additionally thread a per-request causal
+        # tensor for the encoder/decoder attention phase split.
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -406,6 +389,40 @@ class Lfm2DiffusionModelState(ModelState):
 
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
+        seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
+        if for_capture:
+            max_seq_len = self.max_model_len
+        else:
+            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+
+        is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
+        is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
+            input_batch.is_prefilling_np
+        )
+        num_accepted_tokens = None
+        num_decode_draft_tokens_cpu = None
+        if not for_capture and self.vllm_config.num_speculative_tokens > 0:
+            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
+            num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
+                input_batch.idx_mapping
+            ]
+            num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
+            num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+            if num_draft_tokens_per_req is not None:
+                is_decode = (
+                    input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
+                )
+                spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
+                num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
+                    spec_decode_mask, num_draft_tokens_per_req, -1
+                )
+            num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+
+        mamba_attn_metadata = MambaHybridAttnMetadata(
+            is_prefilling=is_prefilling,
+            num_accepted_tokens=num_accepted_tokens,
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        )
 
         # Per-request causal mode: encoder (prompt/commit) = causal,
         # denoise = bidirectional. Pass a GPU tensor for mixed batches.
@@ -426,10 +443,15 @@ class Lfm2DiffusionModelState(ModelState):
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
             seq_lens=input_batch.seq_lens,
-            max_seq_len=self.max_model_len,
+            max_seq_len=max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            model_specific_attn_metadata=mamba_attn_metadata,
+            for_cudagraph_capture=for_capture,
+            rswa_prefix_lens=input_batch.prompt_lens,
             causal=causal,
         )
 
