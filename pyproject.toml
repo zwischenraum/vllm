@@ -58,6 +58,8 @@ include = ["vllm*"]
 "vllm/third_party/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
+# One-off SLURM/GPU validation harness; terse json.load(open(...)) is fine here.
+"examples/lfm2_diffusion/**" = ["SIM115"]
 
 [tool.ruff.lint]
 select = [
