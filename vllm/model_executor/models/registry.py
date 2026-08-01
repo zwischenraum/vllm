@@ -402,6 +402,10 @@ _MULTIMODAL_MODELS = {
         "diffusion_gemma",
         "DiffusionGemmaForConditionalGeneration",
     ),
+    "Lfm2DiffusionForBlockDiffusion": (
+        "lfm2_diffusion",
+        "Lfm2DiffusionForCausalLM",
+    ),
     "Gemma4ForConditionalGeneration": ("gemma4_mm", "Gemma4ForConditionalGeneration"),
     "Gemma4UnifiedForConditionalGeneration": (
         "gemma4_unified",
