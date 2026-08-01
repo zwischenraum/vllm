@@ -335,14 +335,19 @@ class Lfm2DiffusionModelForBlockDiffusionConfig(VerifyAndUpdateConfig):
             raise ValueError(
                 "FlashInfer does not support the LFM2 diffusion decoder's mixed "
                 "causal/bidirectional attention. Use --attention-backend "
-                "FLASH_ATTN or TRITON_ATTN instead."
+                "TRITON_ATTN instead."
             )
-        if attention_config.backend is None and not attention_config.use_non_causal:
+        if attention_config.backend is None:
+            # Per-sequence causal (mixed causal prompt / bidirectional canvas
+            # within a batch) is only implemented by the Triton unified-attention
+            # kernel (USE_PER_SEQ_CAUSAL). The ROCm default backend's
+            # prefix-prefill kernel treats CAUSAL as a scalar constexpr and
+            # rejects a per-request causal tensor, and FlashInfer is unsupported.
+            attention_config.backend = AttentionBackendEnum.TRITON_ATTN
             attention_config.use_non_causal = True
             logger.info(
                 "Lfm2Diffusion uses mixed causal/bidirectional attention within "
-                "a batch; setting use_non_causal=True to exclude FlashInfer from "
-                "auto-selection."
+                "a batch; forcing TRITON_ATTN (per-sequence causal support)."
             )
 
         # Auto-create DiffusionConfig from HF config if not provided.
