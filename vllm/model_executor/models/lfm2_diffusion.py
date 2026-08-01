@@ -259,12 +259,28 @@ def _compiled_sample_step(
         is_denoise, converged, torch.zeros_like(is_commit)
     )
 
-    # Emit: commit steps emit the whole (fully committed) canvas.
+    # Emit (single-canvas termination): a commit step emits the committed canvas
+    # up to and including the first EOS. If the canvas has no EOS (degenerate
+    # full canvas), force the final emitted position to EOS so the request stops
+    # after exactly one canvas instead of re-blocking into a second one.
+    ar = torch.arange(CL, device=device).view(1, CL)
+    eos_mask = cur_canvas == eos_id
+    has_eos = eos_mask.any(dim=1)  # [num_decode]
+    first_eos = (
+        torch.where(eos_mask, ar, torch.full_like(cur_canvas, CL)).min(dim=1).values
+    )  # CL if none
+    last_pos = (valid_canvas_len - 1).clamp(min=0).view(num_decode, 1)
+    force_eos = (is_commit & ~has_eos).view(num_decode, 1) & (ar == last_pos)
+    emit_canvas = torch.where(
+        force_eos, torch.full_like(cur_canvas, eos_id), cur_canvas
+    )
+    emit_len = torch.where(has_eos, first_eos + 1, valid_canvas_len)
+
     emit = is_commit.view(num_decode, 1)
     sampled[decode_idx] = torch.where(
-        emit, cur_canvas, torch.zeros_like(cur_canvas)
+        emit, emit_canvas, torch.zeros_like(cur_canvas)
     ).to(sampled.dtype)
-    num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+    num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * emit_len.to(
         num_sampled.dtype
     )
 
