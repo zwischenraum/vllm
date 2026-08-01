@@ -272,6 +272,38 @@ def _compiled_sample_step(
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
 
+# Debug: one-shot dump of the first denoising step's logits (for the fixed
+# [prefix, all-MASK canvas] input) so a backbone parity harness can compare them
+# against the HF diffusion forward. Inert unless LFM2_DIFF_DUMP_LOGITS is set to
+# an output path.
+_DUMPED_FIRST_STEP = False
+
+
+def _maybe_dump_first_step(
+    logits: torch.Tensor,
+    states: Lfm2DiffusionRequestStates,
+    decode_slots: torch.Tensor,
+    CL: int,
+) -> None:
+    import os
+
+    global _DUMPED_FIRST_STEP
+    path = os.environ.get("LFM2_DIFF_DUMP_LOGITS")
+    if not path or _DUMPED_FIRST_STEP:
+        return
+    if int(states.step[decode_slots].max().item()) != 0:
+        return
+    n = decode_slots.shape[0]
+    torch.save(
+        {
+            "logits": logits.reshape(n, CL, -1).detach().float().cpu(),
+            "canvas": states.canvas[decode_slots].detach().cpu(),
+        },
+        path,
+    )
+    _DUMPED_FIRST_STEP = True
+
+
 # ---------------------------------------------------------------------------
 # ModelState.
 # ---------------------------------------------------------------------------
@@ -618,6 +650,7 @@ class Lfm2DiffusionSampler:
         all_slots = input_batch.idx_mapping[:num_reqs]
 
         if num_decode > 0:
+            _maybe_dump_first_step(logits[: num_decode * CL], states, decode_slots, CL)
             _compiled_sample_step(
                 logits[: num_decode * CL],
                 decode_slots,
