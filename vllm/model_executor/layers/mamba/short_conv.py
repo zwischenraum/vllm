@@ -240,6 +240,23 @@ class ShortConv(MambaBase, CustomOp):
         has_decode = num_decodes > 0
         num_actual_tokens = num_decodes + num_prefill_tokens
 
+        # Diffusion decoders (canvas_length set) re-run the whole output canvas
+        # through the conv every denoising step, always continuing from the same
+        # cached PREFIX conv state. causal_conv1d_fn advances and writes the
+        # canvas's final state back, which would clobber the prefix state for the
+        # next step, so snapshot the pre-forward state for those requests and
+        # restore it afterwards. A diffusion denoise forward is a prefill with an
+        # initial state (has_initial_states_p True); the prompt prefill has it
+        # False. (Assumes the prompt fits one prefill chunk, true for the short
+        # WQE prompts; long-prompt chunked prefill would need is_prefilling to
+        # tell a denoise re-forward from a genuine prefill continuation.)
+        self._diff_restore = (
+            has_prefill
+            and getattr(self.config, "canvas_length", None) is not None
+            and has_initial_states_p is not None
+            and bool(has_initial_states_p.any())
+        )
+
         # NOTE: V1 puts decode before prefill
         # Separate prefill and decode by splitting varlen input
         # Split along token dimension
@@ -262,6 +279,9 @@ class ShortConv(MambaBase, CustomOp):
 
         if has_prefill:
             Bx_p = (B_p * x_p).transpose(0, 1)
+            if self._diff_restore:
+                # Preserve the prefix conv state across diffusion denoise steps.
+                saved_conv_state = conv_state[state_indices_tensor_p].clone()
             Bx = causal_conv1d_fn(
                 Bx_p,
                 conv_weights,
@@ -273,6 +293,9 @@ class ShortConv(MambaBase, CustomOp):
                 metadata=attn_metadata,
                 query_start_loc=query_start_loc_p,
             ).transpose(0, 1)[:num_prefill_tokens]
+            if self._diff_restore:
+                keep = state_indices_tensor_p[has_initial_states_p]
+                conv_state[keep] = saved_conv_state[has_initial_states_p]
 
             y = C_p * Bx
             conv_output_list.append(y)
