@@ -23,3 +23,24 @@ Liquid `diffusion_generate` (HF) harness, on the ROCm `vllm/vllm-openai-rocm`
   prefix→canvas boundary is not yet seeded from the cached prefix conv state
   (the open S4 item).
 - End-to-end decode reproduces the HF reference's v5c-format output per query.
+
+## Fixes validated
+- **Single-canvas termination**: emit the canvas up to the first EOS (force a
+  trailing EOS when a full canvas has none) so the request stops after one canvas
+  instead of re-blocking. Output no longer duplicates.
+- **ShortConv prefix-state preservation (S4)**: the canvas denoise is a prefill
+  with an initial state; causal_conv1d_fn wrote the advanced canvas state back,
+  corrupting the prefix state for later steps. Snapshot+restore keeps the prefix
+  state across denoise steps, which measurably improved decode coherence.
+  (Residual: canvas positions 0-1 still diverge from HF at step 1 — a boundary
+  item needing kernel-level conv-state debugging.)
+
+## Serve benchmark (`bench_serve.sbatch`, SFT ckpt, MI325X, enforce-eager, 128 WQE queries)
+| conc | req/s | out tok/s | median E2EL | P99 E2EL |
+|-----:|------:|----------:|------------:|---------:|
+| 1    | 10.9  | 1116      | 55.9 ms     | 229 ms   |
+| 8    | 20.5  | 2031      | 71.4 ms     | 5163 ms  |
+
+TPOT=0 / TTFT==E2EL is expected (the whole canvas commits at once — no token
+streaming). Median 56 ms at conc=1 (eager) is near the <50 ms target a
+cudagraph/compiled forward would clear.
