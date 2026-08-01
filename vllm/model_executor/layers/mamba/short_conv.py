@@ -76,7 +76,11 @@ class ShortConv(MambaBase, CustomOp):
             prefix=f"{prefix}.out_proj",
         )
 
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        # Widen the conv state for multi-token decode (spec-decode verify or a
+        # diffusion canvas); get_state_shape runs later, outside this context.
+        self.num_spec = vllm_config.num_speculative_tokens
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -217,6 +221,10 @@ class ShortConv(MambaBase, CustomOp):
             state_indices_tensor_d = attn_metadata.state_indices_tensor_d
             has_initial_states_p = attn_metadata.has_initial_states_p
             query_start_loc_p = attn_metadata.query_start_loc_p
+            # Multi-token decode metadata (spec-decode verify, or a diffusion
+            # canvas). None on the single-token AR decode path.
+            num_accepted_tokens = attn_metadata.num_accepted_tokens
+            query_start_loc_d = attn_metadata.query_start_loc_d
 
         BCx, _ = self.in_proj(hidden_states)
 
@@ -240,22 +248,12 @@ class ShortConv(MambaBase, CustomOp):
         has_decode = num_decodes > 0
         num_actual_tokens = num_decodes + num_prefill_tokens
 
-        # Diffusion decoders (canvas_length set) re-run the whole output canvas
-        # through the conv every denoising step, always continuing from the same
-        # cached PREFIX conv state. causal_conv1d_fn advances and writes the
-        # canvas's final state back, which would clobber the prefix state for the
-        # next step, so snapshot the pre-forward state for those requests and
-        # restore it afterwards. A diffusion denoise forward is a prefill with an
-        # initial state (has_initial_states_p True); the prompt prefill has it
-        # False. (Assumes the prompt fits one prefill chunk, true for the short
-        # WQE prompts; long-prompt chunked prefill would need is_prefilling to
-        # tell a denoise re-forward from a genuine prefill continuation.)
-        self._diff_restore = (
-            has_prefill
-            and getattr(self.config, "canvas_length", None) is not None
-            and has_initial_states_p is not None
-            and bool(has_initial_states_p.any())
-        )
+        # A diffusion decoder re-runs its whole output canvas (num_spec tokens)
+        # through the conv every denoising step as a multi-token *decode*, always
+        # continuing from the same cached PREFIX conv state written by the prompt
+        # prefill. It must not persist the advanced canvas state, so the decode
+        # branch snapshots + restores the conv state (below).
+        is_diffusion = getattr(self.config, "canvas_length", None) is not None
 
         # NOTE: V1 puts decode before prefill
         # Separate prefill and decode by splitting varlen input
@@ -279,9 +277,6 @@ class ShortConv(MambaBase, CustomOp):
 
         if has_prefill:
             Bx_p = (B_p * x_p).transpose(0, 1)
-            if self._diff_restore:
-                # Preserve the prefix conv state across diffusion denoise steps.
-                saved_conv_state = conv_state[state_indices_tensor_p].clone()
             Bx = causal_conv1d_fn(
                 Bx_p,
                 conv_weights,
@@ -293,23 +288,45 @@ class ShortConv(MambaBase, CustomOp):
                 metadata=attn_metadata,
                 query_start_loc=query_start_loc_p,
             ).transpose(0, 1)[:num_prefill_tokens]
-            if self._diff_restore:
-                keep = state_indices_tensor_p[has_initial_states_p]
-                conv_state[keep] = saved_conv_state[has_initial_states_p]
 
             y = C_p * Bx
             conv_output_list.append(y)
 
         if has_decode:
             Bx_d = (B_d * x_d).contiguous()
-            Bx = causal_conv1d_update(
-                Bx_d,
-                conv_state,
-                conv_weights,
-                self.conv.bias,
-                activation=None,
-                conv_state_indices=state_indices_tensor_d,
-            )
+            if num_accepted_tokens is not None:
+                # Multi-token decode (spec-decode verify, or a diffusion canvas):
+                # >1 query token per decode request, rolled through the conv state
+                # via query_start_loc + num_accepted_tokens.
+                if is_diffusion:
+                    # The diffusion canvas re-reads the fixed prefix state each
+                    # denoising step and must not advance it. Snapshot the
+                    # per-request conv-state block and restore after the update
+                    # (fixed-shape gather/scatter -> cudagraph-capturable).
+                    diff_block_idx = state_indices_tensor_d[:, 0]
+                    saved_conv_state = conv_state[diff_block_idx].clone()
+                Bx = causal_conv1d_update(
+                    Bx_d,
+                    conv_state,
+                    conv_weights,
+                    self.conv.bias,
+                    activation=None,
+                    conv_state_indices=state_indices_tensor_d,
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=query_start_loc_d,
+                    max_query_len=state_indices_tensor_d.size(-1),
+                )
+                if is_diffusion:
+                    conv_state[diff_block_idx] = saved_conv_state
+            else:
+                Bx = causal_conv1d_update(
+                    Bx_d,
+                    conv_state,
+                    conv_weights,
+                    self.conv.bias,
+                    activation=None,
+                    conv_state_indices=state_indices_tensor_d,
+                )
             y = C_d * Bx
             conv_output_list.insert(0, y)
 
@@ -332,6 +349,7 @@ class ShortConv(MambaBase, CustomOp):
             tp_world_size=get_tensor_model_parallel_world_size(),
             intermediate_size=self.conv_dim,
             conv_kernel=self.L_cache,
+            num_spec=self.num_spec,
         )
 
     @property

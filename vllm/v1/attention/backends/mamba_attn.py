@@ -98,6 +98,17 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         self.compilation_config = vllm_config.compilation_config
         self.num_spec_tokens: int = vllm_config.num_speculative_tokens
         self.use_spec_decode = self.num_spec_tokens > 0
+        # Decode query length = num_spec + the model's per-step "bonus" tokens.
+        # AR (spec-)decode has one bonus token (1 + num_spec). Diffusion decoders
+        # schedule `num_spec` canvas tokens per step with no bonus token
+        # (num_new_sampled_tokens_per_step=0), so their decode query length is
+        # exactly num_spec. Detect diffusion via the diffusion_config.
+        diffusion_config = getattr(vllm_config, "diffusion_config", None)
+        is_diffusion = (
+            diffusion_config is not None
+            and getattr(diffusion_config, "canvas_length", None) is not None
+        )
+        self.decode_query_len: int = self.num_spec_tokens + (0 if is_diffusion else 1)
 
         assert isinstance(kv_cache_spec, MambaSpec)
         scheduler_config = vllm_config.scheduler_config
@@ -145,7 +156,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 )
         else:
             self.state_indices_tensor_d = torch.empty(
-                (self.decode_cudagraph_max_bs, 1 + self.num_spec_tokens),
+                (self.decode_cudagraph_max_bs, self.decode_query_len),
                 dtype=torch.int32,
                 device=device,
             )
@@ -173,14 +184,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         m = common_attn_metadata
 
         assert (
-            m.max_query_len <= 1 + self.num_spec_tokens
+            m.max_query_len <= self.decode_query_len
             and m.num_reqs <= self.decode_cudagraph_max_bs
         ), (
             "Mamba only supports decode-only full CUDAGraph capture. "
             "Make sure all cudagraph capture sizes <= max_num_seq."
         )
 
-        assert m.max_query_len == 1 + self.num_spec_tokens  # decode-only
+        assert m.max_query_len == self.decode_query_len  # decode-only
 
         num_accepted_tokens = None
         if self.num_spec_tokens > 0:
@@ -485,7 +496,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         )
         if self.vllm_config.cache_config.mamba_cache_mode != "all":
             state_indices_tensor_d = state_indices_tensor_d[
-                :, : 1 + self.num_spec_tokens
+                :, : self.decode_query_len
             ]
             state_indices_tensor_p = state_indices_tensor_p[:, 0]
 
@@ -677,7 +688,7 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         )
         if self.vllm_config.cache_config.mamba_cache_mode != "all":
             state_indices_tensor_d = state_indices_tensor_d[
-                :, : 1 + self.num_spec_tokens
+                :, : self.decode_query_len
             ]
             state_indices_tensor_p = state_indices_tensor_p[:, 0]
 

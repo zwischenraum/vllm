@@ -447,29 +447,29 @@ class Lfm2DiffusionModelState(MambaHybridModelState):
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.is_prefilling_np
         )
+        # num_accepted_tokens threads the per-request query length into the
+        # ShortConv build so a diffusion canvas (num_scheduled == num_spec, no AR
+        # bonus token) is classified as a multi-token DECODE and the conv rolls
+        # the whole canvas from the cached prefix state. This matches
+        # build_for_cudagraph_capture's torch.diff(query_start_loc), so the
+        # captured FULL cudagraph and runtime agree. (num_decode_draft_tokens_cpu
+        # is GDN-only and unused by ShortConv.)
         num_accepted_tokens = None
-        num_decode_draft_tokens_cpu = None
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
-            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
-            num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
-                input_batch.idx_mapping
-            ]
-            num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
-            num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
-            if num_draft_tokens_per_req is not None:
-                is_decode = (
-                    input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
-                )
-                spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
-                num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
-                    spec_decode_mask, num_draft_tokens_per_req, -1
-                )
-            num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+            qlens = np.diff(
+                input_batch.query_start_loc_np[: input_batch.num_reqs + 1]
+            ).astype(np.int32)
+            num_accepted_tokens = torch.ones(
+                num_reqs, dtype=torch.int32, device=self.device
+            )
+            num_accepted_tokens[: input_batch.num_reqs] = torch.from_numpy(qlens).to(
+                self.device
+            )
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
-            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            num_decode_draft_tokens_cpu=None,
         )
 
         # Per-request causal mode: encoder (prompt/commit) = causal,
