@@ -57,3 +57,21 @@ vLLM auto-selects FULL cudagraph, which the mamba backend rejects for diffusion:
 token, since `num_new_sampled_tokens_per_step = 0`). PIECEWISE sidesteps it
 (compile attention/MLP, conv eager). FULL cudagraph — capturing the whole hot
 canvas forward — needs a diffusion-aware relaxation of that assertion.
+
+## FULL cudagraph (`bench_serve_full.sbatch`) — captures the whole canvas forward
+Classifying the diffusion canvas as a uniform multi-token **decode** (thread
+`num_accepted_tokens` into the ShortConv build; multi-token `causal_conv1d_update`
+with a fixed-shape snapshot/restore of the prefix conv state; diffusion-aware
+`decode_query_len = num_spec + num_new_sampled` in the mamba backend; widen the
+conv state by `num_spec`) lets vLLM auto-select and capture a **FULL** cudagraph.
+
+| conc=1 E2EL | eager | PIECEWISE cg | **FULL cg** |
+|------------:|------:|-------------:|------------:|
+| median      | 55.9 ms | 41.3 ms | **17.1 ms** |
+| P99         | 229 ms  | 243 ms  | **27.9 ms** |
+
+FULL cudagraph is ~3.3x over eager at the median and P99 27.9 ms — well under the
+50 ms target. Output verified coherent under capture (matches eager/HF). Mean is
+still torch.compile warmup-inflated on an unwarmed benchmark; conc=8 tail is
+warmup + fp32 sampler transients (tune warmup / max_num_seqs). AR spec-decode is
+preserved (`decode_query_len == 1 + num_spec` when the bonus token count is 1).
